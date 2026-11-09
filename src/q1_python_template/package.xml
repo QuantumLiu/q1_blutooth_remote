@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>q1_python_template</name>
+  <version>0.1.0</version>
+  <description>PrimeBot Q1 Python development package template</description>
+  <maintainer email="developer@example.com">Q1 Developer</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>aimdk_msgs</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

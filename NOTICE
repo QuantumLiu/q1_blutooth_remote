@@ -1,0 +1,25 @@
+Q1 蓝牙遥控器
+Copyright 2026 yiliang liu
+
+本仓库的源代码、脚本和文档由 yiliang liu 编写，以 Apache License 2.0 授权，
+许可证全文见同目录 LICENSE 文件。各 ROS 2 包的 package.xml 与 setup.py 中声明的
+许可证与本文件一致。
+
+依赖的启元官方 SDK
+==================
+
+本仓库不包含官方 SDK 的源码、二进制或文档副本，运行时通过 Q1_SDK_ROOT 使用独立
+安装的启元（PrimeBot）Q1 官方 ROS 2 SDK：
+
+- 消息与服务接口：aimdk_msgs，官方在 package.xml 中声明为 Apache License 2.0。
+- Python 模块 common.mc_action_switcher：位于官方 SDK 的 examples/python 目录，
+  运行时由 scripts/run_walk_control.sh 和 scripts/run_remote_supervisor.sh 通过
+  PYTHONPATH 引用，未复制进本仓库，版权归原始 SDK 提供方所有。
+- 官方 SDK 未提供公开仓库地址或整体 LICENSE 文件，其使用受官方《友好用户使用声明》
+  约束；部署和分发业务程序时请自行确认 SDK 的授权条件。
+
+第三方组件
+==========
+
+本仓库不分发第三方库。ROS 2 Humble、Fast DDS 及 Python 标准库等组件遵循各自的
+许可证，使用时请查阅对应项目。

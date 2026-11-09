@@ -1,0 +1,44 @@
+{
+  "active_address": "<R1_BT_ADDR>",
+  "profiles": {
+    "<R1_BT_ADDR>": {
+      "name": "Magicsee R1",
+      "mode": "game",
+      "input_source": "magicsee_r1",
+      "inputs": ["Magicsee R1"],
+      "keys": {
+        "lateral_right": 304,
+        "lateral_left": 308
+      },
+      "axes": {
+        "0": {
+          "neutral": 1,
+          "negative_role": "turn_left",
+          "negative_value": 0,
+          "positive_role": "turn_right",
+          "positive_value": 2
+        },
+        "1": {
+          "neutral": 1,
+          "negative_role": "forward",
+          "negative_value": 0,
+          "positive_role": "backward",
+          "positive_value": 2
+        }
+      },
+      "action_mode": "short_long",
+      "action_keys": [310],
+      "action_key_labels": ["O"],
+      "hold_seconds": 2,
+      "preset_motions": {
+        "307": 3001,
+        "305": 3003
+      },
+      "preset_key_labels": {
+        "307": "C",
+        "305": "D"
+      },
+      "disable_sources": ["rc"]
+    }
+  }
+}

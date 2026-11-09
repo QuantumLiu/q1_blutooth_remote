@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>q1_cpp_template</name>
+  <version>0.1.0</version>
+  <description>PrimeBot Q1 C++ development package template</description>
+  <maintainer email="developer@example.com">Q1 Developer</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>aimdk_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
