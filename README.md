@@ -78,13 +78,14 @@ PC 与机器人必须使用同一 `ROS_DOMAIN_ID`，防火墙需允许 DDS 的 U
 
 ### 2.4 避免其他控制源抢占
 
-系统自带的 `rc` 进程会读取同一只手柄，可能让机器人在进入走跑后自动前进。控制器启动实机模式时会：
+系统自带的 `rc` 进程会通过 SDL 读取同一只手柄，可能让机器人在进入走跑后自动前进。本项目在 R1 连接期间会：
 
-1. 注册独立输入源 `magicsee_r1`，优先级 30。
-2. 通过 `SetMcInputSource` 禁用 `rc`；禁用失败会拒绝运动。
-3. 退出时如果机器人仍站立或走跑，保持 `rc` 禁用，避免恢复瞬间被接管。
+1. 由语音监督服务停掉 `rc` 应用；R1 断开后自动恢复。
+2. 注册独立输入源 `magicsee_r1`，优先级 30，并通过 `SetMcInputSource` 禁用 `rc` 输入源。
+3. 启动控制器时允许 `rc` 作为“上次控制源”短暂残留，首次方向指令后复核控制权，抢不到就停车退出。
+4. 退出时只要手柄还连着，就保持 `rc` 禁用，避免恢复瞬间被接管。
 
-测试期间不要同时打开 APP 遥控、其他手柄或其它会发送速度指令的程序。
+因此在 R1 连接期间，原厂实体遥控器会被禁用；站起/趴下请用语音、APP 或 R1 的 O 序列。测试期间不要同时打开 APP 遥控、其他手柄或其它会发送速度指令的程序。
 
 ## 3. 手柄设置
 
@@ -151,7 +152,7 @@ sudo usermod -aG input "$USER"
 
 | 操作 | 事件 | 行为 |
 | --- | --- | --- |
-| 上 / 下 | `ABS_Y=0 / 2`，回中 `1` | 前进 `+0.20 m/s` / 后退 `-0.20 m/s` |
+| 上 / 下 | `ABS_Y=0 / 2`，回中 `1` | 前进 `+0.40 m/s` / 后退 `-0.40 m/s` |
 | 左 / 右 | `ABS_X=0 / 2`，回中 `1` | 左转 `+0.40 rad/s` / 右转 `-0.40 rad/s` |
 | A | `BTN_WEST` 308 | 向左平移 `+0.20 m/s` |
 | B | `BTN_SOUTH` 304 | 向右平移 `-0.20 m/s` |
@@ -281,11 +282,13 @@ chmod 600 config/remotes.json
 
 **站起 / 趴下**（O 键）：
 
-1. 短按 O，并在 0.8 秒内松开。
-2. 1.5 秒内再次按住 O 约 2 秒。
+1. 短按 O，并在 `short_press_max`（默认 0.8 秒）内松开。
+2. `sequence_timeout`（默认 1.5 秒）内再次按住 O 约 `hold_seconds`（默认 2 秒）。
 3. 机器人语音询问“是否执行站起/趴下”，日志同时打印提示。
 4. 松开 O。
 5. 15 秒内短按 O 确认；超时自动取消。
+
+两次按键间隔超过 `sequence_timeout` 会被当成两次独立短按，需要重来。R1 保持默认值 0.8 / 1.5 秒即可；只有换成手感差异较大的其他手柄时，才需要在 `config/remotes.json` 里调整这两个字段。
 
 趴下时该序列执行 `STAND_UP`，等待进入 `BIPED_WALK_RUN`；站立时执行 `LIE_FACE_DOWN`，等待进入 `PASSIVE_DEFAULT`。语音服务不可用时仍可看日志完成确认，不会跳过二次确认。
 
@@ -308,7 +311,7 @@ chmod 600 config/remotes.json
 | `input_source` | 档案中的 `magicsee_r1` | 运控输入源名称 |
 | `priority` | `30` | 输入源优先级 |
 | `event_timeout` | `0`（关闭） | 无新事件多少秒后自动停车；建议实机设为 `1.0` |
-| `forward_speed` | `0.20` | 前进/后退速度上限，m/s |
+| `forward_speed` | `0.40` | 前进/后退速度上限，m/s |
 | `lateral_speed` | `0.20` | 横移速度上限，m/s |
 | `angular_speed` | `0.40` | 转向速度上限，rad/s |
 | `forward_acceleration` | `0.50` | 前后加速度平滑 |
@@ -348,7 +351,7 @@ chmod 600 config/remotes.json
 
 1. 构建并把项目部署到 `/robot/software/r1_remote`。
 2. 备份 process_manager 配置到 `/robot/persist/config/`。
-3. 把 `r1_remote` 加入第二阶段开机启动列表。
+3. 自动读取 process_manager 实际加载的机器人配置（`RUN_ROBOT_FILE`），把 `r1_remote` 加到与 `rc` 相同的启动阶段，尽早接管冲突输入源。
 
 在机器人上执行：
 
@@ -366,7 +369,7 @@ sudo Q1_SDK_ROOT="$Q1_SDK_ROOT" Q1_PROCESS_CONFIG=/path/to/q1_*_config.yaml \
   ./scripts/install_remote_supervisor.sh
 ```
 
-如果提示找不到预期的启动阶段，说明固件配置格式不同，脚本不会修改文件；请按官方 SDK 的板载模块接入指南手动添加启动项。
+如果脚本找不到 process_manager 配置或启动阶段，会在写文件前报错退出，不会破坏原配置；此时用 `Q1_PROCESS_CONFIG` 指定正确路径，或按官方 SDK 的板载模块接入指南手动添加。
 
 安装后**下次开机生效**。开机只启动监督服务，不会自动连接手柄，也不会自动运动。
 
@@ -374,26 +377,29 @@ sudo Q1_SDK_ROOT="$Q1_SDK_ROOT" Q1_PROCESS_CONFIG=/path/to/q1_*_config.yaml \
 
 | 说法 | 作用 |
 | --- | --- |
-| 启动R1遥控 / 启动R1遥控器 | 连接已绑定的手柄并启动控制器 |
+| 启动手柄 / 启动游戏手柄 | 连接已绑定的手柄并启动控制器（推荐，ASR 最稳） |
+| 启动R1遥控 / 启动R1遥控器 | 同上，兼容旧说法 |
 | 绑定蓝牙遥控器 / 绑定遥控器 / 绑定蓝牙手柄 / 绑定手柄 | 首次绑定：搜索 → 询问 → 确认 |
 | 确认连接 / 确认 / 确定 / 是 | 确认绑定 |
 | 取消 / 取消绑定 / 取消连接 | 取消当前绑定操作 |
 
-首次使用：先说“绑定蓝牙遥控器”，确认连接成功后，再说“启动R1遥控”。
+首次使用：先说“绑定蓝牙遥控器”，确认连接成功后，再说“启动手柄”。
 
 注意：
 
-- “启动R1遥控”只连接已绑定的手柄；未绑定时会提示先绑定。
-- 不要用“连接蓝牙遥控器”代替“启动R1遥控”。云端语音服务可能把它识别成设备绑定任务，弹出验证码流程。
+- 推荐说“启动手柄”。实测“启动R1遥控”会被 ASR 偶尔识别成“启动语音遥控”“启动二十一遥控”，监督服务已按“启动/打开/开启 + 遥控/手柄”做模糊匹配，但短句更稳。
+- “启动手柄”只连接已绑定的手柄；未绑定时会提示先绑定。
+- 不要用“连接蓝牙遥控器”代替“启动手柄”。云端语音服务可能把它识别成设备绑定任务，弹出验证码流程。
 - 云端仍可能把自定义短语当普通问答并播报无关内容。监督服务会在收到指令后的 12 秒内拦截非本项目播报，自己的提示不受影响。
 - 语音启动成功后如果按键没反应，先检查手柄是否还在游戏模式。
+- 首次使用或系统升级后，执行一次 `sudo bash scripts/install_voice_overrides.sh`，把语音仲裁切到本地优先，并把云端绑定验证码播报置空；然后**重启机器人**生效。脚本会先备份 `nlu_arbitration_config.json`、`nlu_rules.json` 和 `skills.json`。不要单独重启 `agent`，实测会让唤醒词和 ASR 一起失效。
 
 ### 6.3 日志与卸载
 
 监督服务输出：
 
 ```bash
-tail -f /tmp/r1_remote.err
+tail -f /robot/persist/log/r1_remote/supervisor.log
 ```
 
 ROS 节点日志在 `~/.ros/log/`。
@@ -404,7 +410,7 @@ ROS 节点日志在 `~/.ros/log/`。
 
    ```bash
    ls -t /robot/persist/config/q1_*_config.yaml.*.bak | head
-   sudo cp <备份文件> /robot/software/process_manager/bin/cfg/q1_v2d0_soc1_config.yaml
+   sudo cp <备份文件> <安装时的配置路径，例如 /robot/software/process_manager/bin/cfg/q1/qy2502_soc0_config.yaml>
    ```
 
 2. 删除部署目录：
@@ -421,13 +427,15 @@ ROS 节点日志在 `~/.ros/log/`。
 | --- | --- | --- |
 | 提示“未找到唯一输入节点” | 手柄未连接、名字或地址不匹配 | `bluetoothctl info` 确认已连接；`/proc/bus/input/devices` 核对 `Name=` 和 `Uniq`；必要时改 `inputs` |
 | 语音启动成功但按键无反应 | 手柄不在游戏模式 | 按说明书 `M + A/B/C/D` 切到游戏模式 |
-| 进入走跑后自动前进 | 系统 `rc` 读取了同一手柄 | 确认日志里 `rc` 已禁用；不要同时开 APP 遥控；必要时重启机器人 |
+| 进入走跑后自动前进 | 系统 `rc` 仍在读手柄 | 确认 `/robot/persist/log/r1_remote/supervisor.log` 出现“已停止 rc 应用”，且 R1 连接时 `ps -ef \| grep aima-rc-app` 无输出 |
+| 控制器启动后立即退出，日志提示当前控制源为 `rc` | 上次控制源残留 | 正常会在首次方向指令后复核；若持续退出，确认监督服务在运行、`rc` 应用已停止 |
 | 无法进入 `BIPED_WALK_RUN` | 机器人不在可站立状态，或运控服务异常 | 让机器人稳定站立或趴下；`ros2 service list` 检查运控服务 |
 | 服务不存在或超时 | 开发者模式未生效、SDK 与固件不匹配 | 重新上下电；用匹配版本的 SDK 重新构建 |
 | 构建报 `Q1_SDK_ROOT` | SDK 路径错误或未编译 | 设置正确路径，确认 `$Q1_SDK_ROOT/install/setup.bash` |
 | 采集按键提示权限不足 | 当前用户不能读 `/dev/input` | 加入 `input` 组后重新登录 |
 | 机器人不停 | 松开事件丢失、手柄断连 | 立即用独立急停；下次运行加 `event_timeout:=1.0` |
-| 语音指令没反应 | 云端 NLU 抢答或未识别 | 看 `/tmp/r1_remote.err`；使用 6.2 节的标准说法 |
+| 语音指令没反应 | 云端 NLU 抢答或未识别 | 看 `/robot/persist/log/r1_remote/supervisor.log`；使用 6.2 节的标准说法 |
+| 开机后喊“启仔启仔”没反应，拍头后正常 | 出厂唤醒引擎尚未就绪或未检测到，与本项目无关 | 开机后等约 30 秒再试；拍头是出厂强制唤醒；仍异常时看 `voice_trace.jsonl` 是否有 `wakeup` 事件 |
 
 ## 8. 兼容性
 

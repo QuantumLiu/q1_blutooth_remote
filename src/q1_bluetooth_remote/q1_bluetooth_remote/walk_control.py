@@ -189,7 +189,7 @@ class WalkControl(Node):
         confirmation_timeout = float(
             self.declare_parameter("confirmation_timeout", 15.0).value
         )
-        forward_speed = self._speed_parameter("forward_speed", 0.2)
+        forward_speed = self._speed_parameter("forward_speed", 0.4)
         lateral_speed = self._speed_parameter("lateral_speed", 0.2)
         angular_speed = self._speed_parameter("angular_speed", 0.4)
         forward_rate = self._speed_parameter("forward_acceleration", 0.5)
@@ -208,15 +208,24 @@ class WalkControl(Node):
             if self.profile.get("action_mode") == "short_long"
             else LongPressActionState
         )
+        gesture_kwargs = {
+            "action_keys": self.profile["action_keys"],
+            "key_labels": self.profile["action_key_labels"],
+        }
+        if gesture_class is PressHoldActionState:
+            gesture_kwargs.update(
+                short_press_max=float(self.profile.get("short_press_max", 0.8)),
+                sequence_timeout=float(self.profile.get("sequence_timeout", 1.5)),
+            )
         self.actions = gesture_class(
             hold_time,
             confirmation_timeout,
-            action_keys=self.profile["action_keys"],
-            key_labels=self.profile["action_key_labels"],
+            **gesture_kwargs,
         )
         self.key_names = {
             code: role for role, code in self.profile["keys"].items()
         }
+        self.movement_codes = set(self.profile["keys"].values())
         self.key_names.update(
             zip(self.profile["action_keys"], self.profile["action_key_labels"])
         )
@@ -242,6 +251,7 @@ class WalkControl(Node):
         self.input_source_registered = False
         self.ownership_verified = False
         self.motion_started_time = None
+        self.last_resume_attempt = 0.0
         self.publisher = None
         self.set_client = None
         self.get_client = None
@@ -478,14 +488,22 @@ class WalkControl(Node):
                 code = response.response.header.code if response else "无响应"
                 self.get_logger().error(f"禁用冲突输入源 {source} 失败：{code}")
                 return False
-            self.disabled_sources.append(source)
+            if source not in self.disabled_sources:
+                self.disabled_sources.append(source)
             self.get_logger().info(f"已禁用冲突输入源：{source}")
         return True
 
     def _restore_conflicting_sources(self):
-        if self.current_action in STANDING_ACTIONS and self.disabled_sources:
+        remote_connected = True
+        try:
+            find_profile_inputs(self.profile)
+        except RuntimeError:
+            remote_connected = False
+        if self.disabled_sources and (
+            remote_connected or self.current_action in STANDING_ACTIONS
+        ):
             self.get_logger().warning(
-                "机器人仍处于站立/走跑状态，为避免冲突输入源接管，退出后保持其禁用状态"
+                "遥控器仍连接或机器人处于站立/走跑状态，退出后保持冲突输入源禁用"
             )
             self.disabled_sources = []
             return
@@ -501,7 +519,9 @@ class WalkControl(Node):
                 self.get_logger().info(f"已恢复输入源：{source}")
         self.disabled_sources = []
 
-    def _verify_control_ownership(self, allow_empty=False):
+    def _verify_control_ownership(
+        self, allow_empty=False, allow_disabled=False, advisory=False
+    ):
         if not self.get_client.wait_for_service(timeout_sec=5.0):
             self.get_logger().error("GetCurrentInputSource 服务不可用")
             return False
@@ -521,6 +541,17 @@ class WalkControl(Node):
             )
             return True
         if current != self.input_source:
+            if allow_disabled and current in self.profile.get("disable_sources", []):
+                self.get_logger().warning(
+                    f"当前控制源仍为 {current}，但该输入源已禁用，将在首次运动指令后复核"
+                )
+                return True
+            if advisory:
+                self.get_logger().warning(
+                    f"当前控制源为 {current or '(empty)'}，启动阶段不阻止；"
+                    "将在首次运动指令后复核控制权"
+                )
+                return True
             self.get_logger().error(
                 f"当前输入源为 {current or '(empty)'}，不是 {self.input_source}，拒绝运动"
             )
@@ -558,7 +589,41 @@ class WalkControl(Node):
             self._publish_velocity()
             rclpy.spin_once(self, timeout_sec=0.02)
             time.sleep(0.03)
-        return self._verify_control_ownership(allow_empty=True)
+        return self._verify_control_ownership(
+            allow_empty=True, allow_disabled=True, advisory=True
+        )
+
+    def _resume_walk_mode(self):
+        now = time.monotonic()
+        if now - self.last_resume_attempt < 2.0:
+            return False
+        self.last_resume_attempt = now
+        self.get_logger().info("检测到方向输入，从全身控制切回走跑模式")
+        self._stop_motion()
+        switcher = McActionSwitcher(self)
+        options = McActionSwitchOptions(
+            source="bluetooth_walk_control",
+            total_timeout=30.0,
+        )
+        result = switcher.switch_to("BIPED_WALK_RUN", options)
+        if not result.success:
+            self.get_logger().error(f"切回 BIPED_WALK_RUN 失败：{result.message}")
+            return False
+        self.current_action = "BIPED_WALK_RUN"
+        if not self._register_input_source():
+            return False
+        if not self._disable_conflicting_sources():
+            return False
+        self._stop_motion()
+        for _ in range(3):
+            self._publish_velocity()
+            rclpy.spin_once(self, timeout_sec=0.02)
+            time.sleep(0.03)
+        self.ownership_verified = False
+        self.motion_started_time = None
+        self.last_resume_attempt = 0.0
+        self.get_logger().info("已切回走跑模式，可以继续用方向控制")
+        return True
 
     def _publish_velocity(self):
         now = time.monotonic()
@@ -588,6 +653,13 @@ class WalkControl(Node):
                 self.buffers[fd] = self.buffers[fd][EVENT_STRUCT.size :]
                 _, _, event_type, code, value = EVENT_STRUCT.unpack(raw)
                 if event_type == EV_ABS:
+                    if (
+                        self.execute
+                        and self.current_action == "BIPED_WHOLE_BODY_CTRL"
+                    ):
+                        neutral = self.buttons.axismap.get(code, {}).get("neutral")
+                        if value != neutral and not self._resume_walk_mode():
+                            continue
                     if self.execute and self.current_action not in STANDING_ACTIONS:
                         continue
                     target = self.buttons.handle_axis(code, value)
@@ -609,6 +681,14 @@ class WalkControl(Node):
                     continue
                 if event_type != EV_KEY or code not in self.supported_codes:
                     continue
+                if (
+                    self.execute
+                    and self.current_action == "BIPED_WHOLE_BODY_CTRL"
+                    and value == 1
+                    and code in self.movement_codes
+                ):
+                    if not self._resume_walk_mode():
+                        continue
                 was_combo_active = self.actions.combo_active
                 confirmed_action = self.actions.handle_event(code, value)
                 if confirmed_action:
@@ -621,7 +701,13 @@ class WalkControl(Node):
                     if not was_combo_active:
                         self._stop_motion()
                         labels = " + ".join(self.profile["action_key_labels"])
-                        self.get_logger().info(f"检测到 {labels} 动作序列，已抑制平移")
+                        window = getattr(self.actions, "sequence_timeout", 1.5)
+                        hold = getattr(self.actions, "hold_seconds", 5.0)
+                        self.get_logger().info(
+                            f"检测到 {labels} 动作序列：短按后 "
+                            f"{window:.1f} 秒内再次按住 {labels} "
+                            f"{hold:.1f} 秒，已抑制平移"
+                        )
                     continue
                 if self.actions.pending:
                     continue

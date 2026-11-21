@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -13,7 +14,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
 from aimdk_msgs.msg import AsrResult, CommonRequest, TtsPriorityLevel, TtsStatus
-from aimdk_msgs.srv import PlayTts, StopTtsTraceId
+from aimdk_msgs.srv import PlayTts, SetMcInputSource, StopTtsTraceId
 
 from q1_bluetooth_remote.input_devices import find_profile_inputs
 from q1_bluetooth_remote.remote_profiles import (
@@ -56,6 +57,15 @@ class RemoteSupervisor(Node):
         self.recent_event_order = []
         self.suppress_cloud_tts_until = 0.0
         self.stopped_trace_ids = set()
+        self.guard_sources = list(self.profile.get("disable_sources", []))
+        self.guard_disabled = set()
+        self.guard_future = None
+        self.guard_pending = None
+        self.guard_last_send = 0.0
+        self.remote_online = False
+        self.rc_app_task = None
+        self.rc_app_stopped = None
+        self.rc_app_check = 0.0
 
         self.create_subscription(
             AsrResult,
@@ -75,6 +85,10 @@ class RemoteSupervisor(Node):
         self.stop_tts_client = self.create_client(
             StopTtsTraceId, "/aimdk_5Fmsgs/srv/StopTtsTraceId"
         )
+        self.set_input_client = self.create_client(
+            SetMcInputSource, "/aimdk_5Fmsgs/srv/SetMcInputSource"
+        )
+        self.create_timer(1.0, self._guard_conflicting_inputs)
         self.create_timer(1.0, self._monitor_controller)
         self.get_logger().info(
             f"语音监督服务已启动；目标：{self.profile['name']} "
@@ -124,10 +138,22 @@ class RemoteSupervisor(Node):
         if not msg.is_final:
             return
         command = "".join(msg.text.split()).strip("，。！？!?,. ").upper()
-        if command not in (
-            CONNECT_COMMANDS | BIND_COMMANDS | CONFIRM_COMMANDS | CANCEL_COMMANDS
-        ):
+        action = None
+        if command in CONNECT_COMMANDS:
+            action = "connect"
+        elif command in BIND_COMMANDS:
+            action = "bind"
+        elif command in CONFIRM_COMMANDS:
+            action = "confirm"
+        elif command in CANCEL_COMMANDS:
+            action = "cancel"
+        elif re.search(r"(启动|打开|开启).*(遥控|手柄)", command):
+            action = "connect"
+        elif re.search(r"(绑定|配对).*(遥控|手柄)", command):
+            action = "bind"
+        if action is None:
             return
+        self.get_logger().info(f"收到语音指令：{msg.text} -> {action}")
         self.suppress_cloud_tts_until = time.monotonic() + 12.0
         if msg.event_id:
             if msg.event_id in self.recent_events:
@@ -137,11 +163,11 @@ class RemoteSupervisor(Node):
             if len(self.recent_event_order) > 32:
                 self.recent_events.discard(self.recent_event_order.pop(0))
 
-        if command in CONNECT_COMMANDS:
+        if action == "connect":
             self._start_worker(self._connect_and_start)
-        elif command in BIND_COMMANDS:
+        elif action == "bind":
             self._start_worker(self._prepare_binding)
-        elif command in CONFIRM_COMMANDS:
+        elif action == "confirm":
             self._confirm_binding()
         else:
             self.pending_bind_address = None
@@ -333,6 +359,136 @@ class RemoteSupervisor(Node):
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=3)
+
+    def _remote_online(self):
+        try:
+            find_profile_inputs(self.profile)
+        except RuntimeError:
+            return False
+        return True
+
+    @staticmethod
+    def _guard_request(source, action):
+        request = SetMcInputSource.Request()
+        request.request = CommonRequest()
+        request.action.value = action
+        request.input_source.name = source
+        request.input_source.priority = 0
+        request.input_source.timeout = 1000
+        return request
+
+    def _guard_conflicting_inputs(self):
+        if not self.guard_sources:
+            return
+        if self.guard_future is not None and not self.guard_future.done():
+            return
+        online = self._remote_online()
+        if online != self.remote_online:
+            self.remote_online = online
+            if online:
+                self.get_logger().info("已检测到 R1 输入节点，开始接管冲突输入源")
+                self._set_rc_app(running=False)
+            else:
+                self.get_logger().info("R1 输入节点已断开")
+                self._set_rc_app(running=True)
+        now = time.monotonic()
+        if online and self.rc_app_stopped is not True and now - self.rc_app_check >= 5.0:
+            self.rc_app_check = now
+            self._set_rc_app(running=False)
+        if now - self.guard_last_send < 1.0:
+            return
+        action = 2002 if online else 2001
+        if online:
+            pending = [
+                source for source in self.guard_sources
+                if source not in self.guard_disabled
+            ]
+        else:
+            pending = [
+                source for source in self.guard_sources
+                if source in self.guard_disabled
+            ]
+        if online and not pending and now - self.guard_last_send >= 3.0:
+            pending = self.guard_sources
+        if not pending:
+            return
+        if not self.set_input_client.service_is_ready():
+            return
+        source = pending[0]
+        self.guard_pending = (source, action)
+        self.guard_last_send = now
+        self.guard_future = self.set_input_client.call_async(
+            self._guard_request(source, action)
+        )
+        self.guard_future.add_done_callback(self._on_guard_result)
+
+    def _on_guard_result(self, future):
+        pending = self.guard_pending
+        self.guard_pending = None
+        if pending is None:
+            return
+        source, action = pending
+        try:
+            response = future.result()
+        except Exception as error:
+            self.get_logger().warning(f"输入源守卫调用失败：{error}")
+            return
+        if response.response.header.code != 0:
+            if source == "rc" and response.response.header.code == 1 and self.rc_app_stopped:
+                self.guard_disabled.add(source)
+                return
+            self.get_logger().warning(
+                f"输入源守卫操作 {source} 失败：code={response.response.header.code}"
+            )
+            return
+        if action == 2002:
+            if source not in self.guard_disabled:
+                self.get_logger().warning(
+                    f"R1 已连接，已禁用 {source} 输入源，避免系统遥控链路读取手柄"
+                )
+            self.guard_disabled.add(source)
+        else:
+            if source in self.guard_disabled:
+                self.get_logger().info(f"R1 已断开，已恢复 {source} 输入源")
+            self.guard_disabled.discard(source)
+
+    def _set_rc_app(self, running):
+        if "rc" not in self.guard_sources:
+            return
+        if self.rc_app_task is not None and self.rc_app_task.is_alive():
+            return
+
+        def worker():
+            yamo = shutil.which("yamo") or "/usr/local/bin/yamo"
+            action = "start-app" if running else "stop-app"
+            try:
+                result = subprocess.run(
+                    [yamo, "em", action, "rc"],
+                    capture_output=True,
+                    text=True,
+                    timeout=25,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                self.get_logger().warning(f"rc 应用操作失败：{error}")
+                return
+            if result.returncode != 0:
+                output = f"{result.stdout}\n{result.stderr}".lower()
+                if "not started" in output or "already started" in output:
+                    self.rc_app_stopped = not running
+                    return
+                self.get_logger().warning(
+                    f"rc 应用 {action} 失败：{result.stderr.strip() or result.stdout.strip()}"
+                )
+                return
+            self.rc_app_stopped = not running
+            if running:
+                self.get_logger().info("R1 已断开，已恢复 rc 应用")
+            else:
+                self.get_logger().warning("R1 已连接，已停止 rc 应用，避免其读取手柄")
+
+        self.rc_app_task = threading.Thread(target=worker, daemon=True)
+        self.rc_app_task.start()
 
     def _monitor_controller(self):
         process = self.controller_process
