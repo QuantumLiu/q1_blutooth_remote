@@ -430,6 +430,67 @@ ROS 节点日志在 `~/.ros/log/`。
 
 3. 重启机器人。如需解除手柄配对，执行 `bluetoothctl remove <R1_BT_ADDR>`。
 
+### 6.4 手动启动、验证与恢复
+
+手动运行监督服务（不经过 process_manager）：
+
+```bash
+source scripts/env.sh
+./scripts/run_remote_supervisor.sh
+```
+
+只验证语音连接、不启动实机控制：
+
+```bash
+./scripts/run_remote_supervisor.sh --ros-args -p controller_execute:=false
+```
+
+开机服务的停止/重启（只动监督服务，不要重启 `agent`）：
+
+```bash
+yamo em stop-app r1_remote
+yamo em start-app r1_remote
+```
+
+验证语音覆盖是否生效：
+
+```bash
+python3 - <<'PY'
+import json
+base = '/robot/software/aimrt_agent/bin/cfg/q1/'
+print('mode:', json.load(open(base + 'nlu_arbitration_config.json'))['mode'])
+rules = json.load(open(base + 'nlu_rules.json'))
+print('local rule:', any(i.get('name') == 'r1_remote_control' for i in rules['intents']))
+skills = json.load(open(base + 'skills.json'))
+print('bind tts:', [s['execution_sequence'] for s in skills['skills']
+                    if s['skill_name'] == 'bind_service_req'])
+PY
+```
+
+预期输出分别是 `offline_priority`、`True`、`[[]]`。
+
+拦截原厂语音分三层：
+
+1. `nlu_arbitration_config.json` 改成 `offline_priority`，本地规则能识别的遥控指令不再交给云端执行。
+2. `nlu_rules.json` 增加 `r1_remote_control` 关键词，命中后执行安全的停车动作。
+3. `skills.json` 把 `bind_service_req` 的播报动作清空，云端即使命中绑定意图也不会念验证码；监督服务还会在收到指令后的 12 秒内用 `StopTtsTraceId` 拦掉其他云端播报。
+
+恢复原厂语音：
+
+1. 备份在 `/robot/persist/config/`，文件名形如 `nlu_rules.json.20261113_145100.bak`。
+2. 对三个文件分别找最新备份并覆盖回 `/robot/software/aimrt_agent/bin/cfg/q1/`：
+
+   ```bash
+   ls -t /robot/persist/config/nlu_arbitration_config.json.*.bak | head -1
+   ls -t /robot/persist/config/nlu_rules.json.*.bak | head -1
+   ls -t /robot/persist/config/skills.json.*.bak | head -1
+   sudo cp <备份文件> /robot/software/aimrt_agent/bin/cfg/q1/<原文件名>
+   ```
+
+3. 重启机器人。唤醒词和 VTN 配置从未被修改，不需要恢复。
+
+注意：`install_voice_overrides.sh` 只修改 NLU 和技能文件，不碰唤醒词；改完必须整机重启，单独重启 `agent` 会让唤醒词和 ASR 一起失效。
+
 ## 7. 常见问题
 
 | 现象 | 可能原因 | 处理 |
@@ -473,7 +534,8 @@ q1_bluetooth_remote/
 │   ├── run_walk_control.sh    # 运行运动控制器
 │   ├── run_remote_supervisor.sh   # 手动运行语音监督服务
 │   ├── start_remote_supervisor.sh # 板载 process_manager 启动入口
-│   └── install_remote_supervisor.sh # 部署开机语音监督服务
+│   ├── install_remote_supervisor.sh # 部署开机语音监督服务
+│   └── install_voice_overrides.sh   # 语音本地优先、屏蔽云端验证码
 ├── docs/
 │   └── R1遥控器验证记录.md    # 实机键位、模式与限制
 ├── R1 Bluetooth remote.jpg    # 手柄实物与淘宝购买二维码
